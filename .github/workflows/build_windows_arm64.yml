@@ -56,9 +56,10 @@ jobs:
       - name: 检查 Dart 架构
         shell: pwsh
         run: |
-          dart --version
-          dart -e "import 'dart:io'; void main(){ print('OS=${Platform.operatingSystem} ARCH=${Platform.version}'); }" 2>$null
-          if ($LASTEXITCODE -ne 0) { Write-Output "（dart -e 不可用，跳过，以上面 dart --version 的 arm64 字样为准）" }
+          $v = (dart --version 2>&1 | Out-String)
+          Write-Output $v.Trim()
+          if ($v -notmatch 'windows_arm64') { throw "Dart 不是 arm64 宿主，实际输出：$v" }
+          Write-Output "Dart 架构校验通过：windows_arm64"
 
       - name: 还原依赖
         shell: pwsh
@@ -100,3 +101,4 @@ jobs:
           path: build/windows/arm64/runner/Release/**/*
           if-no-files-found: error
           compression-level: 9
+
