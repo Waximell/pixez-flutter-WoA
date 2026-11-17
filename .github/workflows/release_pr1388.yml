@@ -1,0 +1,176 @@
+name: Release 1.9.87 (PR #1388)
+
+# 一次性工作流：为未合并的 PR #1388 构建并发布一个 WoA 版本。
+# 只允许手动触发，不随任何 push 运行。
+# 目标提交：3580e164（PR head，版本号 1.9.87+512）。
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and release 1.9.87 (WoA)
+    runs-on: windows-11-arm
+    timeout-minutes: 180
+
+    steps:
+      - name: 签出 PR #1388 的提交
+        uses: actions/checkout@v7
+        with:
+          ref: 3580e16400485bb15afdb064ae26778baa486a94
+          fetch-depth: 1
+
+      - name: 确认宿主架构
+        shell: pwsh
+        run: |
+          Write-Output "PROCESSOR_ARCHITECTURE = $env:PROCESSOR_ARCHITECTURE"
+          Write-Output "OSArchitecture = $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
+          $ver = (Select-String -Path pubspec.yaml -Pattern '^version:').Line
+          Write-Output "pubspec: $ver"
+
+      - name: 安装 Flutter（arm64 宿主引导）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = '3.47.9'
+          $zip = Join-Path $env:RUNNER_TEMP 'flutter.zip'
+          $url = "https://storage.googleapis.com/flutter_infra_release/releases/stable/windows/flutter_windows_$ver-stable.zip"
+
+          Write-Output "下载 Flutter $ver"
+          curl.exe -fL --retry 3 --retry-delay 5 -o $zip $url
+          Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP -Force
+          $flutterRoot = Join-Path $env:RUNNER_TEMP 'flutter'
+
+          # 官方 zip 里的 Dart SDK 是 x64 的：删缓存，让 arm64 版 PowerShell 重新下载 aarch64 SDK。
+          Remove-Item (Join-Path $flutterRoot 'bin\cache\dart-sdk') -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item (Join-Path $flutterRoot 'bin\cache\engine-dart-sdk.stamp') -Force -ErrorAction SilentlyContinue
+          & (Join-Path $flutterRoot 'bin\internal\update_dart_sdk.ps1')
+
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $flutterRoot 'bin')
+          & (Join-Path $flutterRoot 'bin\flutter.bat') --version
+          & (Join-Path $flutterRoot 'bin\flutter.bat') precache --windows
+
+      - name: 检查 Dart 架构
+        shell: pwsh
+        run: |
+          $v = (dart --version 2>&1 | Out-String)
+          Write-Output $v.Trim()
+          if ($v -notmatch 'windows_arm64') { throw "Dart 不是 arm64 宿主，实际输出：$v" }
+          Write-Output "Dart 架构校验通过：windows_arm64"
+
+      - name: 还原依赖
+        shell: pwsh
+        run: flutter pub get --no-example --enforce-lockfile
+
+      - name: 生成代码（rhttp）
+        shell: pwsh
+        working-directory: plugins/rhttp/rhttp
+        run: dart run build_runner build
+
+      - name: 生成代码（PixEz）
+        shell: pwsh
+        run: dart run build_runner build
+
+      - name: 构建 Windows arm64
+        shell: pwsh
+        run: flutter build windows --release --no-pub
+
+      - name: 校验产物是 arm64
+        shell: pwsh
+        run: |
+          $exe = 'build\windows\arm64\runner\Release\pixez.exe'
+          if (-not (Test-Path $exe)) { throw "没找到产物：$exe" }
+          $fs = [System.IO.File]::OpenRead((Resolve-Path $exe))
+          $br = New-Object System.IO.BinaryReader($fs)
+          $fs.Position = 0x3C
+          $pe = $br.ReadInt32()
+          $fs.Position = $pe + 4
+          $machine = $br.ReadUInt16()
+          $br.Close(); $fs.Close()
+          Write-Output ("PE Machine = 0x{0:X4}" -f $machine)
+          if ($machine -ne 0xAA64) { throw ("不是 arm64（0xAA64），实际 0x{0:X4}" -f $machine) }
+          Write-Output "架构校验通过：原生 arm64"
+
+      - name: 生成并签名 MSIX
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.MSIX_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.MSIX_PFX_PASSWORD }}
+          PUBLISHER: ${{ secrets.MSIX_CERT_SUBJECT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:PFX_B64) { throw "缺少 secret MSIX_PFX_BASE64" }
+          $pfx = Join-Path $env:RUNNER_TEMP 'msix-signing.pfx'
+          [System.IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
+
+          dart run msix:create `
+            --build-windows=false `
+            --architecture=arm64 `
+            --certificate-path=$pfx `
+            --certificate-password=$env:PFX_PASSWORD `
+            --publisher="$env:PUBLISHER" `
+            --output-name=pixez-woa-arm64 `
+            --output-path=out
+          if ($LASTEXITCODE -ne 0) { throw "MSIX 生成失败（退出码 $LASTEXITCODE）" }
+          Get-ChildItem out -Filter *.msix | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: 校验 MSIX 签名
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msix = Get-ChildItem out -Filter *.msix | Select-Object -First 1
+          if (-not $msix) { throw "没有产出 .msix" }
+          $sig = Get-AuthenticodeSignature $msix.FullName
+          Write-Output "Status = $($sig.Status)"
+          Write-Output "Signer = $($sig.SignerCertificate.Subject)"
+          if (-not $sig.SignerCertificate) { throw "MSIX 没有签名" }
+          if ($sig.SignerCertificate.Subject -notmatch 'CN=Waximell') { throw "签名者不是预期证书" }
+
+      - name: 打包 zip
+        shell: pwsh
+        run: |
+          $src = 'build\windows\arm64\runner\Release'
+          $zip = 'pixez-woa-1.9.87-windows-arm64.zip'
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "$src\*" -DestinationPath $zip -CompressionLevel Optimal
+          Get-Item $zip | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: pr1388-1897-arm64
+          path: |
+            build/windows/arm64/runner/Release/**/*
+            out/*.msix
+            pixez-woa-1.9.87-windows-arm64.zip
+          if-no-files-found: error
+          compression-level: 9
+
+      - name: 创建 Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $notes = @'
+此版本为 v1.9.87（PR #1388，提交 3580e164），为对 https://github.com/Notsfsssf/pixez-flutter/issues/1386 的修复版本，推荐先安装此版本导入必要数据后，覆盖更新新版本。
+
+本项目未对项目源码做调整，仅添加并运行 WoA Workflow。
+
+核心内容为向 runner 内拉入官方 Flutter 并指定 aarch64，并简单校验。
+
+经初步测试与上游行为未发现偏离。
+
+msix 签名为我自行生成的密钥，不保证私钥安全，非常不建议信任，如果有意使用本项目产物请务必使用松散 exe。
+'@
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          Set-Content -Path $notesFile -Value $notes -Encoding UTF8NoBOM
+
+          $assets = @(Get-ChildItem out -Filter *.msix | ForEach-Object { $_.FullName })
+          $assets += (Get-Item 'pixez-woa-1.9.87-windows-arm64.zip').FullName
+
+          gh release create 'v1.9.87-woa' @assets --title 'v1.9.87 (WoA, PR #1388)' --notes-file $notesFile
+          if ($LASTEXITCODE -ne 0) { throw "Release 创建失败" }
