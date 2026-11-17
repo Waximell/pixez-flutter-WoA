@@ -1,0 +1,89 @@
+name: "Check upstream release"
+
+# 职责：被 master 的 push 触发（例如你手动同步上游之后），只做一件事——
+# 比较上游最新 Release 与本仓库最近一次 Release 的时间。
+#   · 上游没有更新的发布 → 什么都不做，几秒钟结束
+#   · 上游有更新的发布 → 触发 build_windows_arm64.yml（带 publish_release=true）
+# 本文件不构建、不发布，构建逻辑全部留在 build_windows_arm64.yml。
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '忽略上游判断，强制触发一次构建（仅用于手动测试）'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  actions: write # 触发另一个 workflow 需要 actions: write
+
+jobs:
+  check:
+    name: Compare upstream release
+    runs-on: ubuntu-latest
+    steps:
+      - name: 判断上游是否有新 Release
+        id: gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          emit() {
+            echo "$1" >> "$GITHUB_OUTPUT"
+          }
+
+          if [ "${FORCE:-false}" = "true" ]; then
+            echo "手动勾选了 force，直接触发构建"
+            emit "should_run=true"
+            exit 0
+          fi
+
+          up=$(gh api repos/Notsfsssf/pixez-flutter/releases \
+                --jq '[.[] | select(.draft==false and .prerelease==false)][0] | "\(.published_at)\t\(.tag_name)"' || true)
+          if [ -z "$up" ] || [ "$up" = "null" ]; then
+            echo "上游没有任何 Release，无事发生"
+            emit "should_run=false"
+            exit 0
+          fi
+
+          up_time=$(printf '%s' "$up" | cut -f1)
+          up_tag=$(printf '%s' "$up" | cut -f2)
+          our=$(gh api "repos/${{ github.repository }}/releases" \
+                --jq '[.[] | select(.draft==false)][0].published_at // ""' || true)
+
+          echo "上游最新 Release：$up_tag @ $up_time"
+          echo "本仓库最近 Release：${our:-（无）}"
+
+          if [ -z "$our" ]; then
+            echo "本仓库还没有 Release，需要构建"
+            emit "should_run=true"
+            exit 0
+          fi
+
+          if [ "$(date -d "$up_time" +%s)" -gt "$(date -d "$our" +%s)" ]; then
+            echo "上游在上次发布之后有过 Release → 触发构建"
+            emit "should_run=true"
+          else
+            echo "上游 Release 不比本仓库新 → 无事发生"
+            emit "should_run=false"
+          fi
+
+      - name: 触发 Build Windows arm64
+        if: steps.gate.outputs.should_run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh workflow run build_windows_arm64.yml \
+            --repo "$GITHUB_REPOSITORY" \
+            --ref master \
+            -f publish_release=true
+          sleep 8
+          gh run list --repo "$GITHUB_REPOSITORY" --workflow build_windows_arm64.yml \
+            --limit 1 --json databaseId,status,event \
+            --jq '.[0] | "已触发 run \(.databaseId)（\(.status)）"'

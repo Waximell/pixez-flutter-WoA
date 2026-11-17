@@ -15,13 +15,19 @@ on:
         description: 'Release 标签（留空则自动用 v<版本>-woa；同版本重复发布时手动指定，如 v1.9.89-woa.2）'
         type: string
         default: ''
-  push:
-    branches: [master]
-    paths:
-      - '.github/workflows/build_windows_arm64.yml'
+
+# 本 workflow 只负责"构建 + 可选发布"，不做上游判断。
+# 上游判断在 check_upstream_release.yml：它被 master 的 push 触发，确认上游有新 Release 后
+# 通过 workflow_dispatch 调起这里（带 publish_release=true）。
 
 permissions:
   contents: write
+
+# 同一时间只保留一个构建；排队中的运行会在前一个结束后立刻开始，
+# 若期间已有同版本 Release，会在"确定版本与发布标签"步骤 10 秒内失败，不会白跑一小时。
+concurrency:
+  group: build-windows-arm64
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -40,6 +46,34 @@ jobs:
         run: |
           Write-Output "PROCESSOR_ARCHITECTURE = $env:PROCESSOR_ARCHITECTURE"
           Write-Output "OSArchitecture = $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
+
+      - name: 确定版本与发布标签
+        shell: pwsh
+        env:
+          TAG_INPUT: ${{ inputs.release_tag }}
+          PUBLISH: ${{ inputs.publish_release }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 版本号从 pubspec.yaml 实时读取，上游同步后无需改任何文件
+          $full = ((Select-String -Path pubspec.yaml -Pattern '^version:').Line -replace '^version:\s*', '').Trim()
+          if (-not $full) { throw "读不到 pubspec.yaml 的 version" }
+          $short = ($full -split '\+')[0]
+
+          $tag = $env:TAG_INPUT
+          if (-not $tag) { $tag = "v$short-woa" }
+
+          Write-Output "版本：$full"
+          Write-Output "标签：$tag"
+
+          # 提前检查标签占用，避免下载 1GB Flutter、编译一小时后才失败
+          if ($env:PUBLISH -eq 'true') {
+            gh release view $tag --json tagName 2>$null | Out-Null
+            if ($LASTEXITCODE -eq 0) { throw "Release $tag 已存在。同版本重复发布请手动 dispatch 并指定 release_tag（如 $tag.2）" }
+          }
+
+          "RELEASE_VERSION=$full" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
       - name: 安装 Flutter（arm64 宿主引导）
         shell: pwsh
@@ -165,21 +199,12 @@ jobs:
           if-no-files-found: error
           compression-level: 9
 
-      - name: 准备 Release 文案与标签
+      - name: 准备 Release 文案
         if: ${{ inputs.publish_release }}
         shell: pwsh
-        env:
-          TAG: ${{ inputs.release_tag }}
         run: |
           $ErrorActionPreference = 'Stop'
-          # 版本号从 pubspec.yaml 实时读取，上游同步后无需改任何文件
-          $full = ((Select-String -Path pubspec.yaml -Pattern '^version:').Line -replace '^version:\s*', '').Trim()
-          if (-not $full) { throw "读不到 pubspec.yaml 的 version" }
-          $short = ($full -split '\+')[0]
-
-          $tag = $env:TAG
-          if (-not $tag) { $tag = "v$short-woa" }
-
+          $full = $env:RELEASE_VERSION
           $tpl = if (Test-Path 'packaging/RELEASE-NOTES.md') {
             Get-Content 'packaging/RELEASE-NOTES.md' -Raw
           } else {
@@ -189,9 +214,7 @@ jobs:
 
           $file = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           Set-Content -Path $file -Value $notes -Encoding utf8NoBOM
-          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Output "版本：$full"
-          Write-Output "标签：$tag"
+          Write-Output "标签：$env:RELEASE_TAG"
 
       # ---- 可选：创建 GitHub Release（默认不触发）----
       - name: 创建 Release
