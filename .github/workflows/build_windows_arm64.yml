@@ -12,7 +12,7 @@ on:
         type: boolean
         default: false
       release_tag:
-        description: 'Release 标签（publish_release=true 时必填），如 v1.9.89-woa.1'
+        description: 'Release 标签（留空则自动用 v<版本>-woa；同版本重复发布时手动指定，如 v1.9.89-woa.2）'
         type: string
         default: ''
   push:
@@ -165,21 +165,45 @@ jobs:
           if-no-files-found: error
           compression-level: 9
 
+      - name: 准备 Release 文案与标签
+        if: ${{ inputs.publish_release }}
+        shell: pwsh
+        env:
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # 版本号从 pubspec.yaml 实时读取，上游同步后无需改任何文件
+          $full = ((Select-String -Path pubspec.yaml -Pattern '^version:').Line -replace '^version:\s*', '').Trim()
+          if (-not $full) { throw "读不到 pubspec.yaml 的 version" }
+          $short = ($full -split '\+')[0]
+
+          $tag = $env:TAG
+          if (-not $tag) { $tag = "v$short-woa" }
+
+          $tpl = if (Test-Path 'packaging/RELEASE-NOTES.md') {
+            Get-Content 'packaging/RELEASE-NOTES.md' -Raw
+          } else {
+            "此分发随上游 master 编译，为 {{VERSION}}"
+          }
+          $notes = $tpl.Replace('{{VERSION}}', $full).TrimEnd()
+
+          $file = Join-Path $env:RUNNER_TEMP 'release-notes.md'
+          Set-Content -Path $file -Value $notes -Encoding utf8NoBOM
+          "RELEASE_TAG=$tag" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Output "版本：$full"
+          Write-Output "标签：$tag"
+
       # ---- 可选：创建 GitHub Release（默认不触发）----
       - name: 创建 Release
         if: ${{ inputs.publish_release }}
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ inputs.release_tag }}
         run: |
           $ErrorActionPreference = 'Stop'
-          if (-not $env:TAG) { throw "publish_release=true 但没有填 release_tag" }
+          $tag = $env:RELEASE_TAG
+          $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
           $assets = @(Get-ChildItem out -Filter *.msix | ForEach-Object { $_.FullName })
           $assets += (Get-Item 'pixez-woa-windows-arm64.zip').FullName
-          if (Test-Path 'packaging/RELEASE-NOTES.md') {
-            gh release create $env:TAG @assets --title $env:TAG --notes-file 'packaging/RELEASE-NOTES.md'
-          } else {
-            gh release create $env:TAG @assets --title $env:TAG --generate-notes
-          }
+          gh release create $tag @assets --title $tag --notes-file $notesFile
           if ($LASTEXITCODE -ne 0) { throw "Release 创建失败" }
