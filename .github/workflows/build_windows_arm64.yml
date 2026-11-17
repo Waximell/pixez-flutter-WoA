@@ -1,14 +1,27 @@
 name: Build Windows arm64
 
-# 目标：在 GitHub 官方 WOA runner（windows-11-arm）上编出原生 arm64 的 PixEz。
+# 目标：在 GitHub 官方 WOA runner（windows-11-arm）上编出原生 arm64 的 PixEz，
+# 并产出两份分发物：自签名的 MSIX 安装包 + 松散 zip。
 # 上游自己的 build_windows.yml 固定 windows-2022 + x64，本文件是并行新增的，不改动它。
 
 on:
   workflow_dispatch:
+    inputs:
+      publish_release:
+        description: '构建完成后创建 GitHub Release'
+        type: boolean
+        default: false
+      release_tag:
+        description: 'Release 标签（publish_release=true 时必填），如 v1.9.89-woa.1'
+        type: string
+        default: ''
   push:
     branches: [master]
     paths:
       - '.github/workflows/build_windows_arm64.yml'
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -91,14 +104,82 @@ jobs:
           $machine = $br.ReadUInt16()
           $br.Close(); $fs.Close()
           Write-Output ("PE Machine = 0x{0:X4}" -f $machine)
-          if ($machine -ne 0xAA64) { throw "不是 arm64（0xAA64），实际 0x{0:X4}" -f $machine }
+          if ($machine -ne 0xAA64) { throw ("不是 arm64（0xAA64），实际 0x{0:X4}" -f $machine) }
           Write-Output "架构校验通过：原生 arm64"
+
+      # ---- 分发物 1：自签名 MSIX ----
+      - name: 生成并签名 MSIX
+        shell: pwsh
+        env:
+          PFX_B64: ${{ secrets.MSIX_PFX_BASE64 }}
+          PFX_PASSWORD: ${{ secrets.MSIX_PFX_PASSWORD }}
+          PUBLISHER: ${{ secrets.MSIX_CERT_SUBJECT }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:PFX_B64) { throw "缺少 secret MSIX_PFX_BASE64" }
+          $pfx = Join-Path $env:RUNNER_TEMP 'msix-signing.pfx'
+          [System.IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:PFX_B64))
+
+          dart run msix:create `
+            --build-windows=false `
+            --architecture=arm64 `
+            --certificate-path=$pfx `
+            --certificate-password=$env:PFX_PASSWORD `
+            --publisher="$env:PUBLISHER" `
+            --output-name=pixez-woa-arm64 `
+            --output-path=out
+          if ($LASTEXITCODE -ne 0) { throw "MSIX 生成失败（退出码 $LASTEXITCODE）" }
+
+          Get-ChildItem out -Filter *.msix | Select-Object Name, Length | Format-Table -AutoSize
+
+      - name: 校验 MSIX 签名
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $msix = Get-ChildItem out -Filter *.msix | Select-Object -First 1
+          if (-not $msix) { throw "没有产出 .msix" }
+          $sig = Get-AuthenticodeSignature $msix.FullName
+          Write-Output "Status   = $($sig.Status)"
+          Write-Output "Signer   = $($sig.SignerCertificate.Subject)"
+          if (-not $sig.SignerCertificate) { throw "MSIX 没有签名" }
+          if ($sig.SignerCertificate.Subject -notmatch 'CN=Waximell') { throw "签名者不是预期证书：$($sig.SignerCertificate.Subject)" }
+
+      # ---- 分发物 2：松散 zip ----
+      - name: 打包 zip
+        shell: pwsh
+        run: |
+          $src = 'build\windows\arm64\runner\Release'
+          $zip = 'pixez-woa-windows-arm64.zip'
+          if (Test-Path $zip) { Remove-Item $zip -Force }
+          Compress-Archive -Path "$src\*" -DestinationPath $zip -CompressionLevel Optimal
+          Get-Item $zip | Select-Object Name, Length | Format-Table -AutoSize
 
       - name: 上传产物
         uses: actions/upload-artifact@v7
         with:
           name: windows-arm64-release
-          path: build/windows/arm64/runner/Release/**/*
+          path: |
+            build/windows/arm64/runner/Release/**/*
+            out/*.msix
+            pixez-woa-windows-arm64.zip
           if-no-files-found: error
           compression-level: 9
 
+      # ---- 可选：创建 GitHub Release（默认不触发）----
+      - name: 创建 Release
+        if: ${{ inputs.publish_release }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.release_tag }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if (-not $env:TAG) { throw "publish_release=true 但没有填 release_tag" }
+          $assets = @(Get-ChildItem out -Filter *.msix | ForEach-Object { $_.FullName })
+          $assets += (Get-Item 'pixez-woa-windows-arm64.zip').FullName
+          if (Test-Path 'packaging/RELEASE-NOTES.md') {
+            gh release create $env:TAG @assets --title $env:TAG --notes-file 'packaging/RELEASE-NOTES.md'
+          } else {
+            gh release create $env:TAG @assets --title $env:TAG --generate-notes
+          }
+          if ($LASTEXITCODE -ne 0) { throw "Release 创建失败" }
