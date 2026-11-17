@@ -1,0 +1,102 @@
+name: Build Windows arm64
+
+# 目标：在 GitHub 官方 WOA runner（windows-11-arm）上编出原生 arm64 的 PixEz。
+# 上游自己的 build_windows.yml 固定 windows-2022 + x64，本文件是并行新增的，不改动它。
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+    paths:
+      - '.github/workflows/build_windows_arm64.yml'
+
+jobs:
+  build:
+    name: Build Windows arm64
+    runs-on: windows-11-arm
+    timeout-minutes: 180
+
+    steps:
+      - name: 签出仓库
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+
+      - name: 确认宿主架构
+        shell: pwsh
+        run: |
+          Write-Output "PROCESSOR_ARCHITECTURE = $env:PROCESSOR_ARCHITECTURE"
+          Write-Output "OSArchitecture = $([System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture)"
+
+      - name: 安装 Flutter（arm64 宿主引导）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = '3.47.9'
+          $zip = Join-Path $env:RUNNER_TEMP 'flutter.zip'
+          $url = "https://storage.googleapis.com/flutter_infra_release/releases/stable/windows/flutter_windows_$ver-stable.zip"
+
+          Write-Output "下载 Flutter $ver"
+          curl.exe -fL --retry 3 --retry-delay 5 -o $zip $url
+          Expand-Archive -Path $zip -DestinationPath $env:RUNNER_TEMP -Force
+          $flutterRoot = Join-Path $env:RUNNER_TEMP 'flutter'
+
+          # 官方 zip 里附带的 Dart SDK 是 x64 的。删掉缓存后，由 arm64 版 PowerShell
+          # 执行 update_dart_sdk.ps1，脚本会按宿主架构重新下载 aarch64 的 Dart SDK。
+          # 这一步是本机踩过的坑：不删的话 flutter 会以 x64 身份运行，编出来还是 x64。
+          Remove-Item (Join-Path $flutterRoot 'bin\cache\dart-sdk') -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item (Join-Path $flutterRoot 'bin\cache\engine-dart-sdk.stamp') -Force -ErrorAction SilentlyContinue
+          & (Join-Path $flutterRoot 'bin\internal\update_dart_sdk.ps1')
+
+          Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $flutterRoot 'bin')
+
+          & (Join-Path $flutterRoot 'bin\flutter.bat') --version
+          & (Join-Path $flutterRoot 'bin\flutter.bat') precache --windows
+
+      - name: 检查 Dart 架构
+        shell: pwsh
+        run: |
+          dart --version
+          dart -e "import 'dart:io'; void main(){ print('OS=${Platform.operatingSystem} ARCH=${Platform.version}'); }" 2>$null
+          if ($LASTEXITCODE -ne 0) { Write-Output "（dart -e 不可用，跳过，以上面 dart --version 的 arm64 字样为准）" }
+
+      - name: 还原依赖
+        shell: pwsh
+        run: flutter pub get --no-example --enforce-lockfile
+
+      - name: 生成代码（rhttp）
+        shell: pwsh
+        working-directory: plugins/rhttp/rhttp
+        run: dart run build_runner build
+
+      - name: 生成代码（PixEz）
+        shell: pwsh
+        run: dart run build_runner build
+
+      - name: 构建 Windows arm64
+        shell: pwsh
+        run: flutter build windows --release --no-pub
+
+      - name: 校验产物是 arm64
+        shell: pwsh
+        run: |
+          $exe = 'build\windows\arm64\runner\Release\pixez.exe'
+          if (-not (Test-Path $exe)) { throw "没找到产物：$exe" }
+          $fs = [System.IO.File]::OpenRead((Resolve-Path $exe))
+          $br = New-Object System.IO.BinaryReader($fs)
+          $fs.Position = 0x3C
+          $pe = $br.ReadInt32()
+          $fs.Position = $pe + 4
+          $machine = $br.ReadUInt16()
+          $br.Close(); $fs.Close()
+          Write-Output ("PE Machine = 0x{0:X4}" -f $machine)
+          if ($machine -ne 0xAA64) { throw "不是 arm64（0xAA64），实际 0x{0:X4}" -f $machine }
+          Write-Output "架构校验通过：原生 arm64"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-arm64-release
+          path: build/windows/arm64/runner/Release/**/*
+          if-no-files-found: error
+          compression-level: 9
