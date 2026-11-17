@@ -155,19 +155,19 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           $ErrorActionPreference = 'Stop'
-          $notes = @'
-此版本为 v1.9.87（PR #1388，提交 3580e164），为对 https://github.com/Notsfsssf/pixez-flutter/issues/1386 的修复版本，推荐先安装此版本导入必要数据后，覆盖更新新版本。
-
-本项目未对项目源码做调整，仅添加并运行 WoA Workflow。
-
-核心内容为向 runner 内拉入官方 Flutter 并指定 aarch64，并简单校验。
-
-经初步测试与上游行为未发现偏离。
-
-msix 签名为我自行生成的密钥，不保证私钥安全，非常不建议信任，如果有意使用本项目产物请务必使用松散 exe。
-'@
+          $lines = @(
+            '此版本为 v1.9.87（PR #1388，提交 3580e164），为对 https://github.com/Notsfsssf/pixez-flutter/issues/1386 的修复版本，推荐先安装此版本导入必要数据后，覆盖更新新版本。',
+            '',
+            '本项目未对项目源码做调整，仅添加并运行 WoA Workflow。',
+            '',
+            '核心内容为向 runner 内拉入官方 Flutter 并指定 aarch64，并简单校验。',
+            '',
+            '经初步测试与上游行为未发现偏离。',
+            '',
+            'msix 签名为我自行生成的密钥，不保证私钥安全，非常不建议信任，如果有意使用本项目产物请务必使用松散 exe。'
+          )
           $notesFile = Join-Path $env:RUNNER_TEMP 'release-notes.md'
-          Set-Content -Path $notesFile -Value $notes -Encoding UTF8NoBOM
+          Set-Content -Path $notesFile -Value ($lines -join "`n") -Encoding utf8NoBOM
 
           $assets = @(Get-ChildItem out -Filter *.msix | ForEach-Object { $_.FullName })
           $assets += (Get-Item 'pixez-woa-1.9.87-windows-arm64.zip').FullName
